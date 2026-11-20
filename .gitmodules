@@ -1,0 +1,3 @@
+[submodule "rf-detr.cpp"]
+	path = rf-detr.cpp
+	url = https://github.com/mudler/rf-detr.cpp
