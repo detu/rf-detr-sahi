@@ -11,6 +11,7 @@ set(RFDETR_BUILD_CLI OFF CACHE BOOL "" FORCE)
 add_subdirectory(rf-detr.cpp)
 
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs highgui dnn)
+find_package(OpenMP REQUIRED COMPONENTS CXX)
 
 add_executable(rfdetr_sahi main.cpp)
 
@@ -22,4 +23,5 @@ target_include_directories(rfdetr_sahi PRIVATE
 target_link_libraries(rfdetr_sahi PRIVATE
     rfdetr  # Target name exported by rf-detr.cpp/CMakeLists.txt
     ${OpenCV_LIBS}
+    OpenMP::OpenMP_CXX
 )
