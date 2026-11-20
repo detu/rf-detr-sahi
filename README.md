@@ -27,18 +27,27 @@ git submodule update --init --recursive
 hf download mudler/rfdetr-cpp-medium rfdetr-medium-f16.gguf --local-dir models/
 ```
 
-## Build (Vulkan)
+## Build
 
-Requires CMake ≥ 3.18, a C++17 compiler, OpenCV (core, imgproc, imgcodecs, highgui, dnn),
-and the Vulkan SDK (`glslc` is needed to compile ggml's Vulkan shaders).
+Requires CMake ≥ 3.18, a C++17 compiler with OpenMP, and OpenCV (core, imgproc,
+imgcodecs, highgui, dnn). Pick the compute backend with `SAHI_BACKEND`:
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DSAHI_BACKEND=CUDA    # NVIDIA GPU (needs the CUDA toolkit / nvcc)
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DSAHI_BACKEND=VULKAN  # default; needs Vulkan SDK, SPIRV-Headers, glslc
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DSAHI_BACKEND=CPU     # CPU only
 cmake --build build -j
 ```
 
-The Vulkan backend is forced on in `CMakeLists.txt`. At runtime rf-detr.cpp uses
-Vulkan device 0 and falls back to CPU if no Vulkan device is found.
+Always build in **Release**: a Debug build makes ggml many times slower.
+
+At runtime the GPU backends use device 0 and fall back to CPU if no device is found.
+With a Vulkan build you can force CPU without rebuilding:
+`GGML_VK_VISIBLE_DEVICES= ./build/rfdetr_sahi ...`
+
+**WSL2:** Vulkan in WSL2 goes through Mesa's Dozen driver (Vulkan on Direct3D 12),
+shown as `Microsoft Direct3D12 (...) (Dozen)` at startup. It is very slow for ggml.
+On an NVIDIA GPU use `-DSAHI_BACKEND=CUDA` instead: CUDA runs natively in WSL2.
 
 ## Run
 
