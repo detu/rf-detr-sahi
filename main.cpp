@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <iostream>
 #include <map>
 #include <string>
@@ -203,12 +204,37 @@ int main(int argc, char** argv) {
               << " | Merged detections: " << merged.size() << "\n";
 
     // 6. Draw final detections and save output
+    const cv::Scalar GREEN(0, 255, 0);  // BGR
+    const cv::Scalar BLACK(0, 0, 0);
+    const int FONT = cv::FONT_HERSHEY_SIMPLEX;
+    const double FONT_SCALE = 0.5;
+    const int FONT_THICKNESS = 1;
+    const int PAD = 3;
+
     for (const auto& det : merged) {
-        cv::rectangle(bgr_image, det.box, cv::Scalar(0, 255, 0), 2);
-        std::string name = det.class_name.empty() ? ("ID:" + std::to_string(det.class_id)) : det.class_name;
-        std::string label = name + " " + std::to_string(static_cast<int>(det.confidence * 100)) + "%";
-        cv::putText(bgr_image, label, cv::Point(static_cast<int>(det.box.x), static_cast<int>(std::max(0.0f, det.box.y - 5.0f))),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
+        cv::Rect box(static_cast<int>(std::round(det.box.x)), static_cast<int>(std::round(det.box.y)),
+                     static_cast<int>(std::round(det.box.width)), static_cast<int>(std::round(det.box.height)));
+        cv::rectangle(bgr_image, box, GREEN, 2);
+
+        // Label: "<class name> <score>", e.g. "person 0.87"
+        std::string name = det.class_name.empty() ? ("id " + std::to_string(det.class_id)) : det.class_name;
+        char score[16];
+        std::snprintf(score, sizeof(score), "%.2f", det.confidence);
+        std::string label = name + " " + score;
+
+        int baseline = 0;
+        cv::Size ts = cv::getTextSize(label, FONT, FONT_SCALE, FONT_THICKNESS, &baseline);
+        int bg_w = ts.width + 2 * PAD;
+        int bg_h = ts.height + baseline + 2 * PAD;
+
+        // Place the label above the box; if there's no room, put it just inside the top edge.
+        int bg_x = std::clamp(box.x, 0, std::max(0, bgr_image.cols - bg_w));
+        int bg_y = box.y - bg_h;
+        if (bg_y < 0) bg_y = std::min(std::max(box.y, 0), std::max(0, bgr_image.rows - bg_h));
+
+        cv::rectangle(bgr_image, cv::Rect(bg_x, bg_y, bg_w, bg_h), GREEN, cv::FILLED);
+        cv::putText(bgr_image, label, cv::Point(bg_x + PAD, bg_y + PAD + ts.height),
+                    FONT, FONT_SCALE, BLACK, FONT_THICKNESS, cv::LINE_AA);
     }
 
     cv::imwrite(output_path, bgr_image);
