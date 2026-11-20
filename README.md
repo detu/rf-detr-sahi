@@ -1,6 +1,6 @@
 # rf-detr-sahi
 
-SAHI (Slicing Aided Hyper Inference) on top of [rf-detr.cpp](https://github.com/mudler/rf-detr.cpp).
+SAHI implementation in RF-DETR: Slicing Aided Hyper Inference on top of [rf-detr.cpp](https://github.com/mudler/rf-detr.cpp).
 
 ## Layout
 
