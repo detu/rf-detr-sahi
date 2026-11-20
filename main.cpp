@@ -2,7 +2,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cctype>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <future>
 #include <iostream>
 #include <map>
 #include <string>
@@ -32,12 +36,16 @@ struct SliceWindow {
     int height;
 };
 
+namespace fs = std::filesystem;
+
 struct Options {
     std::string model_path;
-    std::string image_path;
-    std::string output_path = "sahi_output.jpg";
-    int workers = 0;            // parallel tile workers (0 = auto)
-    int threads_per_worker = 0; // ggml threads per worker (0 = auto)
+    std::vector<std::string> inputs;  // image files and/or directories
+    std::string output;               // -o: output file (single image) or directory
+    std::string csv_path;             // --csv: optional detections CSV
+    bool recursive = false;
+    int workers = 0;                  // parallel tile workers (0 = auto)
+    int threads_per_worker = 0;       // ggml threads per worker (0 = auto)
     float overlap = 0.20f;
     float conf = 0.45f;
     float nms_iou = 0.50f;
@@ -53,10 +61,17 @@ static int hardware_threads() {
 
 static void print_usage(const char* prog) {
     std::cerr
-        << "Usage: " << prog << " <model.gguf> <image.jpg> [options]\n"
-        << "  -o, --output <path>    output image (default: sahi_output.jpg)\n"
-        << "  -w, --workers <n>      tiles processed in parallel, one RF-DETR context each\n"
-        << "                         (default: 2, capped by the tile count)\n"
+        << "Usage: " << prog << " <model.gguf> <image|dir> [<image|dir> ...] [options]\n"
+        << "\n"
+        << "Loads the model once and runs SAHI on every image given. Directories are\n"
+        << "scanned for .jpg/.jpeg/.png/.bmp/.tif/.tiff/.webp files (sorted by name).\n"
+        << "\n"
+        << "  -o, --output <path>    single image: output file (default: sahi_output.jpg)\n"
+        << "                         several images: output directory (default: sahi_output/)\n"
+        << "                         files are written as <name>_sahi.<ext>\n"
+        << "      --csv <path>       also write all detections to a CSV file\n"
+        << "  -r, --recursive        scan directories recursively\n"
+        << "  -w, --workers <n>      tiles processed in parallel, one RF-DETR context each (default: 2)\n"
         << "  -t, --threads <n>      ggml CPU threads per worker (default: cores / workers)\n"
         << "      --overlap <r>      tile overlap ratio (default: 0.20)\n"
         << "      --conf <c>         confidence threshold (default: 0.45)\n"
@@ -76,20 +91,64 @@ static bool parse_args(int argc, char** argv, Options& opt) {
         };
         const char* v = nullptr;
         if (a == "-h" || a == "--help") return false;
-        else if (a == "-o" || a == "--output")  { if (!(v = next("--output")))  return false; opt.output_path = v; }
-        else if (a == "-w" || a == "--workers") { if (!(v = next("--workers"))) return false; opt.workers = std::atoi(v); }
-        else if (a == "-t" || a == "--threads") { if (!(v = next("--threads"))) return false; opt.threads_per_worker = std::atoi(v); }
-        else if (a == "--overlap")              { if (!(v = next("--overlap"))) return false; opt.overlap = std::strtof(v, nullptr); }
-        else if (a == "--conf")                 { if (!(v = next("--conf")))    return false; opt.conf = std::strtof(v, nullptr); }
-        else if (a == "--iou")                  { if (!(v = next("--iou")))     return false; opt.nms_iou = std::strtof(v, nullptr); }
-        else if (!a.empty() && a[0] == '-')     { std::cerr << "Unknown option: " << a << "\n"; return false; }
+        else if (a == "-o" || a == "--output")    { if (!(v = next("--output")))  return false; opt.output = v; }
+        else if (a == "--csv")                    { if (!(v = next("--csv")))     return false; opt.csv_path = v; }
+        else if (a == "-r" || a == "--recursive") { opt.recursive = true; }
+        else if (a == "-w" || a == "--workers")   { if (!(v = next("--workers"))) return false; opt.workers = std::atoi(v); }
+        else if (a == "-t" || a == "--threads")   { if (!(v = next("--threads"))) return false; opt.threads_per_worker = std::atoi(v); }
+        else if (a == "--overlap")                { if (!(v = next("--overlap"))) return false; opt.overlap = std::strtof(v, nullptr); }
+        else if (a == "--conf")                   { if (!(v = next("--conf")))    return false; opt.conf = std::strtof(v, nullptr); }
+        else if (a == "--iou")                    { if (!(v = next("--iou")))     return false; opt.nms_iou = std::strtof(v, nullptr); }
+        else if (!a.empty() && a[0] == '-')       { std::cerr << "Unknown option: " << a << "\n"; return false; }
         else positional.push_back(a);
     }
     if (positional.size() < 2) return false;
     opt.model_path = positional[0];
-    opt.image_path = positional[1];
-    if (positional.size() > 2) opt.output_path = positional[2];  // backwards compatible
+    opt.inputs.assign(positional.begin() + 1, positional.end());
     return true;
+}
+
+static bool is_image_file(const fs::path& p) {
+    std::string ext = p.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    static const char* exts[] = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"};
+    for (const char* e : exts) if (ext == e) return true;
+    return false;
+}
+
+// Expand the command-line inputs into a list of image files.
+static std::vector<fs::path> collect_images(const std::vector<std::string>& inputs, bool recursive) {
+    std::vector<fs::path> files;
+    for (const auto& in : inputs) {
+        std::error_code ec;
+        fs::path p(in);
+        if (fs::is_directory(p, ec)) {
+            std::vector<fs::path> found;
+            auto add = [&](const fs::directory_entry& e) {
+                if (e.is_regular_file(ec) && is_image_file(e.path())) found.push_back(e.path());
+            };
+            if (recursive) {
+                for (const auto& e : fs::recursive_directory_iterator(p, fs::directory_options::skip_permission_denied, ec)) add(e);
+            } else {
+                for (const auto& e : fs::directory_iterator(p, ec)) add(e);
+            }
+            std::sort(found.begin(), found.end());
+            if (found.empty()) std::cerr << "Warning: no images found in " << p << "\n";
+            files.insert(files.end(), found.begin(), found.end());
+        } else if (fs::exists(p, ec)) {
+            files.push_back(p);
+        } else {
+            std::cerr << "Warning: input not found, skipping: " << in << "\n";
+        }
+    }
+    return files;
+}
+
+static std::string csv_escape(const std::string& s) {
+    if (s.find_first_of(",\"\n") == std::string::npos) return s;
+    std::string out = "\"";
+    for (char c : s) { if (c == '"') out += '"'; out += c; }
+    return out + "\"";
 }
 
 // 1. Generate overlapping SAHI tile coordinates
@@ -254,6 +313,64 @@ static void draw_detections(cv::Mat& bgr_image, const std::vector<Detection>& de
     }
 }
 
+// Run SAHI on one image with the given contexts; returns merged detections.
+// Results go into per-tile slots and are concatenated in tile order, so the
+// output is identical regardless of thread scheduling.
+static std::vector<Detection> run_sahi(const std::vector<rfdetr_context*>& contexts,
+                                       const rfdetr_detect_params& dparams,
+                                       const cv::Mat& rgb_image,
+                                       int slice_size,
+                                       const Options& opt,
+                                       size_t& n_tiles, size_t& n_raw, int& failed_tiles) {
+    auto slices = generate_slices(rgb_image.cols, rgb_image.rows, slice_size, slice_size, opt.overlap);
+    n_tiles = slices.size();
+
+    // No point in more workers than tiles
+    const int workers = std::max(1, std::min<int>(static_cast<int>(contexts.size()), static_cast<int>(slices.size())));
+
+    std::vector<std::vector<Detection>> per_tile(slices.size());
+    int failed = 0;
+    (void)workers;  // only used by the OpenMP pragma
+
+    #pragma omp parallel num_threads(workers) reduction(+ : failed)
+    {
+#ifdef _OPENMP
+        rfdetr_context* ctx = contexts[omp_get_thread_num()];
+#else
+        rfdetr_context* ctx = contexts[0];
+#endif
+        #pragma omp for schedule(dynamic, 1)
+        for (int i = 0; i < static_cast<int>(slices.size()); ++i) {
+            if (!detect_tile(ctx, dparams, rgb_image, slices[i], per_tile[i])) ++failed;
+        }
+    }
+    failed_tiles = failed;
+
+    size_t total = 0;
+    for (const auto& v : per_tile) total += v.size();
+    std::vector<Detection> all;
+    all.reserve(total);
+    for (auto& v : per_tile) {
+        all.insert(all.end(), std::make_move_iterator(v.begin()), std::make_move_iterator(v.end()));
+    }
+    n_raw = all.size();
+
+    // Deduplicate overlapping detections across tile boundaries
+    return apply_class_aware_nms(all, opt.conf, opt.nms_iou);
+}
+
+struct LoadedImage {
+    cv::Mat bgr;
+    cv::Mat rgb;
+};
+
+static LoadedImage load_image(const fs::path& path) {
+    LoadedImage li;
+    li.bgr = cv::imread(path.string(), cv::IMREAD_COLOR);
+    if (!li.bgr.empty()) cv::cvtColor(li.bgr, li.rgb, cv::COLOR_BGR2RGB);  // RF-DETR expects RGB (HWC, 8-bit)
+    return li;
+}
+
 int main(int argc, char** argv) {
     Options opt;
     if (!parse_args(argc, argv, opt)) {
@@ -261,30 +378,49 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const uint32_t TOP_K = 300;
     using clock = std::chrono::steady_clock;
     const auto t0 = clock::now();
 
-    // Load high-resolution image; RF-DETR expects RGB (HWC, 8-bit)
-    cv::Mat bgr_image = cv::imread(opt.image_path, cv::IMREAD_COLOR);
-    if (bgr_image.empty()) {
-        std::cerr << "Failed to load image: " << opt.image_path << "\n";
+    std::vector<fs::path> images = collect_images(opt.inputs, opt.recursive);
+    if (images.empty()) {
+        std::cerr << "No input images.\n";
         return 1;
     }
-    cv::Mat rgb_image;
-    cv::cvtColor(bgr_image, rgb_image, cv::COLOR_BGR2RGB);
 
-    // ---- Context 0: read the model's input size so we know the tile count ----
-    // The GPU backend is chosen at build time: with RFDETR_GGML_VULKAN=ON
-    // (set in CMakeLists.txt) each context uses Vulkan device 0 and falls back
-    // to CPU if no Vulkan device is found.
+    // Output naming: one image -> -o is a file; several -> -o is a directory.
+    const bool single = images.size() == 1;
+    fs::path out_file, out_dir;
+    if (single) {
+        out_file = opt.output.empty() ? fs::path("sahi_output.jpg") : fs::path(opt.output);
+        if (fs::is_directory(out_file)) out_file /= images[0].stem().string() + "_sahi" + images[0].extension().string();
+    } else {
+        out_dir = opt.output.empty() ? fs::path("sahi_output") : fs::path(opt.output);
+        std::error_code ec;
+        fs::create_directories(out_dir, ec);
+        if (ec) {
+            std::cerr << "Cannot create output directory " << out_dir << ": " << ec.message() << "\n";
+            return 1;
+        }
+    }
+    // Several inputs can share a file name (e.g. in different subdirectories with -r):
+    // add _2, _3, ... so outputs never overwrite each other.
+    std::map<std::string, int> used_names;
+    auto output_for = [&](const fs::path& in) -> fs::path {
+        if (single) return out_file;
+        std::string base = in.stem().string() + "_sahi";
+        std::string ext = in.extension().string();
+        int& n = used_names[base + ext];
+        std::string name = (++n == 1) ? base + ext : base + "_" + std::to_string(n) + ext;
+        return out_dir / name;
+    };
+
+    // ---- Create the RF-DETR contexts once; they are reused for every image ----
+    // The GPU backend is chosen at build time (SAHI_BACKEND in CMakeLists.txt);
+    // each context uses GPU device 0 and falls back to CPU if none is found.
     const int hw = hardware_threads();
     int workers = opt.workers > 0 ? opt.workers : 2;
-    int threads_per_worker = opt.threads_per_worker > 0 ? opt.threads_per_worker
-                                                        : std::max(1, hw / workers);
-
-    std::vector<rfdetr_context*> contexts;
-    auto free_contexts = [&]() { for (auto* c : contexts) rfdetr_free(c); contexts.clear(); };
+    const int threads_per_worker = opt.threads_per_worker > 0 ? opt.threads_per_worker
+                                                              : std::max(1, hw / workers);
 
     auto make_context = [&](rfdetr_status* st) {
         rfdetr_params params{};
@@ -293,28 +429,16 @@ int main(int argc, char** argv) {
         return rfdetr_init(&params, st);
     };
 
+    std::vector<rfdetr_context*> contexts;
     rfdetr_status status = RFDETR_OK;
-    rfdetr_context* first = make_context(&status);
-    if (!first) {
-        std::cerr << "Failed to initialize RF-DETR: " << rfdetr_status_str(status) << "\n";
-        return 1;
-    }
-    contexts.push_back(first);
-
-    // Slice size = the model's native input resolution (384 Nano, 512 Small, 576 Medium)
-    int slice_size = static_cast<int>(rfdetr_context_image_size(first));
-    if (slice_size <= 0) slice_size = 576;
-
-    auto slices = generate_slices(rgb_image.cols, rgb_image.rows, slice_size, slice_size, opt.overlap);
-
-    // No point in more workers than tiles
-    workers = std::max(1, std::min<int>(workers, static_cast<int>(slices.size())));
-
-    // ---- Remaining contexts: one per worker (a context is not shared between threads) ----
     // Loaded serially so a failure is reported cleanly and model I/O isn't contended.
-    for (int w = 1; w < workers; ++w) {
+    for (int w = 0; w < workers; ++w) {
         rfdetr_context* c = make_context(&status);
         if (!c) {
+            if (w == 0) {
+                std::cerr << "Failed to initialize RF-DETR: " << rfdetr_status_str(status) << "\n";
+                return 1;
+            }
             std::cerr << "Warning: could not create context " << w << " ("
                       << rfdetr_status_str(status) << "); continuing with " << w << " worker(s)\n";
             break;
@@ -329,66 +453,94 @@ int main(int argc, char** argv) {
     omp_set_max_active_levels(2);
 #endif
 
-    std::cout << "Model: " << rfdetr_context_variant(first)
-              << " (input " << slice_size << "x" << slice_size << ")\n"
-              << "Running SAHI across " << slices.size() << " tiles with "
+    // Slice size = the model's native input resolution (384 Nano, 512 Small, 576 Medium)
+    int slice_size = static_cast<int>(rfdetr_context_image_size(contexts[0]));
+    if (slice_size <= 0) slice_size = 576;
+
+    rfdetr_detect_params dparams{};
+    dparams.threshold = opt.conf;
+    dparams.top_k = 300;
+    dparams.class_filter = nullptr;
+    dparams.class_filter_len = 0;
+
+    const double init_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+    std::cout << "Model: " << rfdetr_context_variant(contexts[0])
+              << " (input " << slice_size << "x" << slice_size << ") | "
               << workers << " worker(s) x " << threads_per_worker << " thread(s)"
 #ifndef _OPENMP
               << " [built without OpenMP: tiles run sequentially]"
 #endif
-              << "...\n";
+              << " | " << images.size() << " image(s) | init " << static_cast<int>(init_ms) << " ms\n";
 
-    rfdetr_detect_params dparams{};
-    dparams.threshold = opt.conf;
-    dparams.top_k = TOP_K;
-    dparams.class_filter = nullptr;
-    dparams.class_filter_len = 0;
-
-    // ---- Slice -> Infer -> Remap, tiles in parallel ----
-    // Results go into per-tile slots and are concatenated in tile order, so the
-    // output is identical regardless of thread scheduling.
-    std::vector<std::vector<Detection>> per_tile(slices.size());
-    int failed_tiles = 0;
-    const auto t_infer = clock::now();
-
-    #pragma omp parallel num_threads(workers) reduction(+ : failed_tiles)
-    {
-#ifdef _OPENMP
-        rfdetr_context* ctx = contexts[omp_get_thread_num()];
-#else
-        rfdetr_context* ctx = contexts[0];
-#endif
-        #pragma omp for schedule(dynamic, 1)
-        for (int i = 0; i < static_cast<int>(slices.size()); ++i) {
-            if (!detect_tile(ctx, dparams, rgb_image, slices[i], per_tile[i])) ++failed_tiles;
+    std::ofstream csv;
+    if (!opt.csv_path.empty()) {
+        csv.open(opt.csv_path);
+        if (!csv) {
+            std::cerr << "Cannot open CSV file: " << opt.csv_path << "\n";
+            for (auto* c : contexts) rfdetr_free(c);
+            return 1;
         }
+        csv << "image,class_id,class_name,score,x1,y1,x2,y2\n";
     }
 
-    const double infer_ms = std::chrono::duration<double, std::milli>(clock::now() - t_infer).count();
+    // ---- Process images; decode the next one in the background meanwhile ----
+    size_t ok_images = 0, failed_images = 0, total_dets = 0;
+    double total_infer_ms = 0.0;
+    std::future<LoadedImage> next = std::async(std::launch::async, load_image, images[0]);
 
-    size_t total = 0;
-    for (const auto& v : per_tile) total += v.size();
-    std::vector<Detection> all_detections;
-    all_detections.reserve(total);
-    for (auto& v : per_tile) {
-        all_detections.insert(all_detections.end(), std::make_move_iterator(v.begin()), std::make_move_iterator(v.end()));
+    for (size_t idx = 0; idx < images.size(); ++idx) {
+        const fs::path& path = images[idx];
+        LoadedImage img = next.get();
+        if (idx + 1 < images.size()) next = std::async(std::launch::async, load_image, images[idx + 1]);
+
+        std::cout << "[" << (idx + 1) << "/" << images.size() << "] " << path.string() << ": ";
+        if (img.bgr.empty()) {
+            std::cout << "failed to load, skipped\n";
+            ++failed_images;
+            continue;
+        }
+
+        size_t n_tiles = 0, n_raw = 0;
+        int failed_tiles = 0;
+        const auto ti = clock::now();
+        std::vector<Detection> merged = run_sahi(contexts, dparams, img.rgb, slice_size, opt, n_tiles, n_raw, failed_tiles);
+        const double infer_ms = std::chrono::duration<double, std::milli>(clock::now() - ti).count();
+
+        draw_detections(img.bgr, merged);
+        const fs::path out = output_for(path);
+        bool saved = false;
+        try {
+            saved = cv::imwrite(out.string(), img.bgr);
+        } catch (const cv::Exception& e) {
+            std::cerr << "imwrite error: " << e.what() << "\n";
+        }
+
+        if (csv.is_open()) {
+            for (const auto& d : merged) {
+                csv << csv_escape(path.string()) << ',' << d.class_id << ',' << csv_escape(d.class_name) << ','
+                    << d.confidence << ',' << d.box.x << ',' << d.box.y << ','
+                    << (d.box.x + d.box.width) << ',' << (d.box.y + d.box.height) << '\n';
+            }
+        }
+
+        std::printf("%zu tiles, %zu raw -> %zu dets, %.1f ms%s%s\n",
+                    n_tiles, n_raw, merged.size(), infer_ms,
+                    failed_tiles ? (" | " + std::to_string(failed_tiles) + " tile(s) failed").c_str() : "",
+                    saved ? "" : " | could not save output");
+        std::fflush(stdout);
+
+        if (failed_tiles == static_cast<int>(n_tiles) || !saved) ++failed_images; else ++ok_images;
+        total_dets += merged.size();
+        total_infer_ms += infer_ms;
     }
 
-    // Deduplicate overlapping detections across tile boundaries
-    std::vector<Detection> merged = apply_class_aware_nms(all_detections, opt.conf, opt.nms_iou);
-    std::cout << "Raw tile detections: " << all_detections.size()
-              << " | Merged detections: " << merged.size();
-    if (failed_tiles > 0) std::cout << " | Failed tiles: " << failed_tiles;
-    std::cout << "\n";
-
-    draw_detections(bgr_image, merged);
-    cv::imwrite(opt.output_path, bgr_image);
+    for (auto* c : contexts) rfdetr_free(c);
 
     const double total_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
-    std::printf("Inference: %.1f ms (%.1f ms/tile) | Total: %.1f ms\n",
-                infer_ms, slices.empty() ? 0.0 : infer_ms / slices.size(), total_ms);
-    std::cout << "Saved " << opt.output_path << "\n";
-
-    free_contexts();
-    return failed_tiles == static_cast<int>(slices.size()) ? 1 : 0;
+    std::printf("Done: %zu ok, %zu failed, %zu detections | inference %.1f s (%.1f ms/image) | total %.1f s\n",
+                ok_images, failed_images, total_dets, total_infer_ms / 1000.0,
+                images.empty() ? 0.0 : total_infer_ms / images.size(), total_ms / 1000.0);
+    std::cout << "Output: " << (single ? out_file.string() : out_dir.string())
+              << (opt.csv_path.empty() ? "" : " | CSV: " + opt.csv_path) << "\n";
+    return failed_images == 0 ? 0 : 1;
 }

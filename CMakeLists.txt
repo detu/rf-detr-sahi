@@ -1,15 +1,22 @@
 cmake_minimum_required(VERSION 3.18)
-project(rfdetr_sahi_vulkan CXX)
+project(rfdetr_sahi CXX)
+
+# Default to Release: a Debug build makes ggml many times slower.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Compute backend for rf-detr.cpp: VULKAN, CUDA or CPU.
-#   -DSAHI_BACKEND=CUDA    NVIDIA GPU (also the fast path under WSL2)
-#   -DSAHI_BACKEND=VULKAN  native Vulkan driver (slow under WSL2's Dozen driver)
+# Compute backend for rf-detr.cpp: CUDA (default), VULKAN or CPU.
+#   -DSAHI_BACKEND=CUDA    NVIDIA GPU; needs the CUDA toolkit (nvcc). Fast path under WSL2.
+#                          ggml builds only for the GPU in this machine when it can
+#                          (CMake >= 3.24, CUDA >= 11.6); override with -DCMAKE_CUDA_ARCHITECTURES=89.
+#   -DSAHI_BACKEND=VULKAN  native Vulkan driver (very slow under WSL2's Dozen driver)
 #   -DSAHI_BACKEND=CPU     CPU only
-set(SAHI_BACKEND "VULKAN" CACHE STRING "Compute backend: VULKAN, CUDA or CPU")
-set_property(CACHE SAHI_BACKEND PROPERTY STRINGS VULKAN CUDA CPU)
+set(SAHI_BACKEND "CUDA" CACHE STRING "Compute backend: CUDA, VULKAN or CPU")
+set_property(CACHE SAHI_BACKEND PROPERTY STRINGS CUDA VULKAN CPU)
 string(TOUPPER "${SAHI_BACKEND}" SAHI_BACKEND)
 
 set(RFDETR_GGML_VULKAN OFF CACHE BOOL "" FORCE)
@@ -19,9 +26,9 @@ if(SAHI_BACKEND STREQUAL "VULKAN")
 elseif(SAHI_BACKEND STREQUAL "CUDA")
     set(RFDETR_GGML_CUDA ON CACHE BOOL "" FORCE)
 elseif(NOT SAHI_BACKEND STREQUAL "CPU")
-    message(FATAL_ERROR "SAHI_BACKEND must be VULKAN, CUDA or CPU (got '${SAHI_BACKEND}')")
+    message(FATAL_ERROR "SAHI_BACKEND must be CUDA, VULKAN or CPU (got '${SAHI_BACKEND}')")
 endif()
-message(STATUS "rfdetr_sahi backend: ${SAHI_BACKEND}")
+message(STATUS "rfdetr_sahi backend: ${SAHI_BACKEND} (${CMAKE_BUILD_TYPE})")
 
 set(RFDETR_BUILD_CLI OFF CACHE BOOL "" FORCE)
 
