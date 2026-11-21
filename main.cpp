@@ -43,6 +43,7 @@ struct Options {
     std::vector<std::string> inputs;  // image files and/or directories
     std::string output;               // -o: output file (single image) or directory
     std::string csv_path;             // --csv: optional detections CSV
+    std::string names_path;           // --names: class names, one per line (line 1 = class 0)
     bool recursive = false;
     int workers = 0;                  // parallel tile workers (0 = auto)
     int threads_per_worker = 0;       // ggml threads per worker (0 = auto)
@@ -70,6 +71,8 @@ static void print_usage(const char* prog) {
         << "                         several images: output directory (default: sahi_output/)\n"
         << "                         files are written as <name>_sahi.<ext>\n"
         << "      --csv <path>       also write all detections to a CSV file\n"
+        << "  -n, --names <file>     class names, one per line: line 1 = class 0, line 2 = class 1, ...\n"
+        << "                         (default: the names stored in the model)\n"
         << "  -r, --recursive        scan directories recursively\n"
         << "  -w, --workers <n>      tiles processed in parallel, one RF-DETR context each (default: 2)\n"
         << "  -t, --threads <n>      ggml CPU threads per worker (default: cores / workers)\n"
@@ -93,6 +96,7 @@ static bool parse_args(int argc, char** argv, Options& opt) {
         if (a == "-h" || a == "--help") return false;
         else if (a == "-o" || a == "--output")    { if (!(v = next("--output")))  return false; opt.output = v; }
         else if (a == "--csv")                    { if (!(v = next("--csv")))     return false; opt.csv_path = v; }
+        else if (a == "-n" || a == "--names")     { if (!(v = next("--names")))   return false; opt.names_path = v; }
         else if (a == "-r" || a == "--recursive") { opt.recursive = true; }
         else if (a == "-w" || a == "--workers")   { if (!(v = next("--workers"))) return false; opt.workers = std::atoi(v); }
         else if (a == "-t" || a == "--threads")   { if (!(v = next("--threads"))) return false; opt.threads_per_worker = std::atoi(v); }
@@ -142,6 +146,28 @@ static std::vector<fs::path> collect_images(const std::vector<std::string>& inpu
         }
     }
     return files;
+}
+
+// Read class names: line N (1-based) is the name of class N-1. Surrounding
+// whitespace and Windows line endings are stripped. Empty lines are kept, so
+// line numbers stay aligned with class ids; an empty name falls back to the
+// model's name for that class. A UTF-8 byte-order mark at the start is ignored.
+static bool load_class_names(const std::string& path, std::vector<std::string>& names) {
+    std::ifstream f(path);
+    if (!f) return false;
+    names.clear();
+    std::string line;
+    bool first = true;
+    while (std::getline(f, line)) {
+        if (first && line.size() >= 3 && line.compare(0, 3, "\xEF\xBB\xBF") == 0) line.erase(0, 3);
+        first = false;
+        const auto b = line.find_first_not_of(" \t\r\n");
+        const auto e = line.find_last_not_of(" \t\r\n");
+        names.push_back(b == std::string::npos ? std::string() : line.substr(b, e - b + 1));
+    }
+    // Drop trailing empty lines (e.g. a final newline at the end of the file)
+    while (!names.empty() && names.back().empty()) names.pop_back();
+    return true;
 }
 
 static std::string csv_escape(const std::string& s) {
@@ -387,6 +413,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Optional class-name file overrides the names stored in the model.
+    // Read before loading the model so a bad path fails immediately.
+    std::vector<std::string> class_names;
+    if (!opt.names_path.empty() && !load_class_names(opt.names_path, class_names)) {
+        std::cerr << "Cannot read class names file: " << opt.names_path << "\n";
+        return 1;
+    }
+
     // Output naming: one image -> -o is a file; several -> -o is a directory.
     const bool single = images.size() == 1;
     fs::path out_file, out_dir;
@@ -472,6 +506,16 @@ int main(int argc, char** argv) {
 #endif
               << " | " << images.size() << " image(s) | init " << static_cast<int>(init_ms) << " ms\n";
 
+    if (!opt.names_path.empty()) {
+        std::cout << "Class names: " << class_names.size() << " from " << opt.names_path;
+        const uint32_t model_classes = rfdetr_context_num_classes(contexts[0]);
+        if (model_classes > 0 && class_names.size() != model_classes) {
+            std::cout << " (model has " << model_classes << " classes; ids without a name keep the model's name)";
+        }
+        std::cout << "\n";
+    }
+    size_t unnamed_ids = 0;  // detections whose class id has no line in the names file
+
     std::ofstream csv;
     if (!opt.csv_path.empty()) {
         csv.open(opt.csv_path);
@@ -505,6 +549,17 @@ int main(int argc, char** argv) {
         const auto ti = clock::now();
         std::vector<Detection> merged = run_sahi(contexts, dparams, img.rgb, slice_size, opt, n_tiles, n_raw, failed_tiles);
         const double infer_ms = std::chrono::duration<double, std::milli>(clock::now() - ti).count();
+
+        if (!class_names.empty()) {
+            for (auto& d : merged) {
+                if (d.class_id >= 0 && static_cast<size_t>(d.class_id) < class_names.size() &&
+                    !class_names[d.class_id].empty()) {
+                    d.class_name = class_names[d.class_id];
+                } else {
+                    ++unnamed_ids;
+                }
+            }
+        }
 
         draw_detections(img.bgr, merged);
         const fs::path out = output_for(path);
@@ -540,6 +595,10 @@ int main(int argc, char** argv) {
     std::printf("Done: %zu ok, %zu failed, %zu detections | inference %.1f s (%.1f ms/image) | total %.1f s\n",
                 ok_images, failed_images, total_dets, total_infer_ms / 1000.0,
                 images.empty() ? 0.0 : total_infer_ms / images.size(), total_ms / 1000.0);
+    if (unnamed_ids > 0) {
+        std::cout << "Note: " << unnamed_ids << " detection(s) had a class id with no name in "
+                  << opt.names_path << "; the model's name was used for those\n";
+    }
     std::cout << "Output: " << (single ? out_file.string() : out_dir.string())
               << (opt.csv_path.empty() ? "" : " | CSV: " + opt.csv_path) << "\n";
     return failed_images == 0 ? 0 : 1;

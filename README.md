@@ -73,6 +73,7 @@ image files and/or directories.
 | Option | Default | Meaning |
 |---|---|---|
 | `-o, --output` | `sahi_output.jpg` / `sahi_output/` | output file for one image, output directory for several (`<name>_sahi.<ext>`) |
+| `-n, --names` | model's names | text file of class names, one per line: line 1 = class 0, line 2 = class 1, ... |
 | `--csv` | off | write all detections: `image,class_id,class_name,score,x1,y1,x2,y2` |
 | `-r, --recursive` | off | scan directories recursively |
 | `-w, --workers` | 2 | tiles processed in parallel (OpenMP); each worker has its own RF-DETR context |
@@ -80,6 +81,15 @@ image files and/or directories.
 | `--overlap` | 0.20 | tile overlap ratio |
 | `--conf` | 0.45 | confidence threshold |
 | `--iou` | 0.50 | NMS IoU threshold |
+
+With `--names`, the labels on the output images and the `class_name` column in the
+CSV use the names from the file. Windows line endings and surrounding spaces are
+ignored. An empty line, or a class id beyond the end of the file, keeps the model's
+own name for that class.
+
+```bash
+./build/rfdetr_sahi models/rfdetr-medium-f16.gguf images/ -o results/ -n classes.txt
+```
 
 Directories are scanned for `.jpg .jpeg .png .bmp .tif .tiff .webp` (sorted by name).
 The next image is decoded in the background while the current one is processed.
