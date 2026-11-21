@@ -1,3 +1,12 @@
+// RF-DETR tiled inference (rf-detr.cpp / ggml).
+//
+// The image is cut into tiles of the model's input size on a grid with 50%
+// overlap (stride = half a tile by default); the last tile in each row/column
+// is clamped to the image border. Every tile runs through RF-DETR at native
+// resolution. Detections touching an interior tile edge are dropped, because
+// the neighbouring tile sees those objects whole; the rest are mapped back to
+// the image and merged with one class-aware NMS.
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -29,7 +38,7 @@ struct Detection {
     std::string class_name;
 };
 
-struct SliceWindow {
+struct Tile {
     int x;
     int y;
     int width;
@@ -47,7 +56,9 @@ struct Options {
     bool recursive = false;
     int workers = 0;                  // parallel tile workers (0 = auto)
     int threads_per_worker = 0;       // ggml threads per worker (0 = auto)
-    float overlap = 0.20f;
+    int stride = 0;                   // tile stride (0 = half a tile, i.e. 50% overlap)
+    int margin = 8;                   // drop detections within this many px of an interior tile edge
+    float pre_scale = 1.0f;           // downscale the image before tiling (fewer tiles)
     float conf = 0.45f;
     float nms_iou = 0.50f;
 };
@@ -64,21 +75,25 @@ static void print_usage(const char* prog) {
     std::cerr
         << "Usage: " << prog << " <model.gguf> <image|dir> [<image|dir> ...] [options]\n"
         << "\n"
-        << "Loads the model once and runs SAHI on every image given. Directories are\n"
-        << "scanned for .jpg/.jpeg/.png/.bmp/.tif/.tiff/.webp files (sorted by name).\n"
+        << "Loads the model once and runs tiled detection on every image given. Directories\n"
+        << "are scanned for .jpg/.jpeg/.png/.bmp/.tif/.tiff/.webp files (sorted by name).\n"
         << "\n"
-        << "  -o, --output <path>    single image: output file (default: sahi_output.jpg)\n"
-        << "                         several images: output directory (default: sahi_output/)\n"
-        << "                         files are written as <name>_sahi.<ext>\n"
+        << "  -o, --output <path>    single image: output file (default: output.jpg)\n"
+        << "                         several images: output directory (default: output/)\n"
+        << "                         files are written as <name>_det.<ext>\n"
         << "      --csv <path>       also write all detections to a CSV file\n"
         << "  -n, --names <file>     class names, one per line: line 1 = class 0, line 2 = class 1, ...\n"
         << "                         (default: the names stored in the model)\n"
         << "  -r, --recursive        scan directories recursively\n"
         << "  -w, --workers <n>      tiles processed in parallel, one RF-DETR context each (default: 2)\n"
         << "  -t, --threads <n>      ggml CPU threads per worker (default: cores / workers)\n"
-        << "      --overlap <r>      tile overlap ratio (default: 0.20)\n"
+        << "      --stride <n>       tile stride in pixels (default: half a tile, i.e. 50% overlap)\n"
+        << "      --margin <n>       drop detections within n px of an interior tile edge (default: 8)\n"
+        << "      --pre-scale <f>    downscale the image by f (0 < f <= 1) before tiling (default: 1)\n"
         << "      --conf <c>         confidence threshold (default: 0.45)\n"
-        << "      --iou <i>          NMS IoU threshold (default: 0.50)\n";
+        << "      --iou <i>          NMS IoU threshold for merging the tiles (default: 0.50)\n"
+        << "\n"
+        << "Tiles are the model's input size (384 Nano, 512 Small, 576 Medium).\n";
 }
 
 static bool parse_args(int argc, char** argv, Options& opt) {
@@ -100,12 +115,17 @@ static bool parse_args(int argc, char** argv, Options& opt) {
         else if (a == "-r" || a == "--recursive") { opt.recursive = true; }
         else if (a == "-w" || a == "--workers")   { if (!(v = next("--workers"))) return false; opt.workers = std::atoi(v); }
         else if (a == "-t" || a == "--threads")   { if (!(v = next("--threads"))) return false; opt.threads_per_worker = std::atoi(v); }
-        else if (a == "--overlap")                { if (!(v = next("--overlap"))) return false; opt.overlap = std::strtof(v, nullptr); }
+        else if (a == "--stride")                 { if (!(v = next("--stride")))  return false; opt.stride = std::atoi(v); }
+        else if (a == "--margin")                 { if (!(v = next("--margin")))  return false; opt.margin = std::atoi(v); }
+        else if (a == "--pre-scale")              { if (!(v = next("--pre-scale"))) return false; opt.pre_scale = std::strtof(v, nullptr); }
         else if (a == "--conf")                   { if (!(v = next("--conf")))    return false; opt.conf = std::strtof(v, nullptr); }
         else if (a == "--iou")                    { if (!(v = next("--iou")))     return false; opt.nms_iou = std::strtof(v, nullptr); }
         else if (!a.empty() && a[0] == '-')       { std::cerr << "Unknown option: " << a << "\n"; return false; }
         else positional.push_back(a);
     }
+    if (opt.stride < 0) { std::cerr << "--stride must be positive\n"; return false; }
+    if (opt.margin < 0) { std::cerr << "--margin must be 0 or more\n"; return false; }
+    if (!(opt.pre_scale > 0.0f && opt.pre_scale <= 1.0f)) { std::cerr << "--pre-scale must be in (0, 1]\n"; return false; }
     if (positional.size() < 2) return false;
     opt.model_path = positional[0];
     opt.inputs.assign(positional.begin() + 1, positional.end());
@@ -177,57 +197,77 @@ static std::string csv_escape(const std::string& s) {
     return out + "\"";
 }
 
-// 1. Generate overlapping SAHI tile coordinates
-std::vector<SliceWindow> generate_slices(int img_w, int img_h, int slice_w, int slice_h, float overlap_ratio) {
-    std::vector<SliceWindow> slices;
-    int step_x = std::max(1, static_cast<int>(slice_w * (1.0f - overlap_ratio)));
-    int step_y = std::max(1, static_cast<int>(slice_h * (1.0f - overlap_ratio)));
+// 1. Tile grid
 
-    for (int y = 0; y < img_h; y += step_y) {
-        int h = std::min(slice_h, img_h - y);
-        // Shift window back if we hit the bottom edge so slice keeps full native resolution
-        int start_y = (h < slice_h && img_h >= slice_h) ? (img_h - slice_h) : y;
-        h = std::min(slice_h, img_h - start_y);
-
-        for (int x = 0; x < img_w; x += step_x) {
-            int w = std::min(slice_w, img_w - x);
-            // Shift window back if we hit the right edge
-            int start_x = (w < slice_w && img_w >= slice_w) ? (img_w - slice_w) : x;
-            w = std::min(slice_w, img_w - start_x);
-
-            slices.push_back({start_x, start_y, w, h});
-
-            if (start_x + w >= img_w) break;
-        }
-        if (start_y + h >= img_h) break;
-    }
-    return slices;
+// Number of tile positions along one axis so that the last tile ends exactly
+// at the image border, without duplicate tiles.
+static int tile_count(int length, int size, int stride) {
+    if (length <= size) return 1;
+    return (length - size + stride - 1) / stride + 1;
 }
 
-// 2. Run RF-DETR on one tile and return detections in full-image coordinates.
+// Tile grid over an image of at least size x size pixels: a row/column every
+// `stride` pixels, the last one clamped to the border.
+static std::vector<Tile> tile_grid(int img_w, int img_h, int size, int stride) {
+    std::vector<Tile> tiles;
+    const int nx = tile_count(img_w, size, stride);
+    const int ny = tile_count(img_h, size, stride);
+    tiles.reserve(static_cast<size_t>(nx) * ny);
+    for (int r = 0; r < ny; ++r) {
+        for (int c = 0; c < nx; ++c) {
+            const int x = std::max(0, std::min(c * stride, img_w - size));
+            const int y = std::max(0, std::min(r * stride, img_h - size));
+            tiles.push_back({x, y, std::min(size, img_w), std::min(size, img_h)});
+        }
+    }
+    return tiles;
+}
+
+// The image the tiles are cut from: optionally downscaled (fewer tiles), and
+// padded bottom/right with gray to at least one tile, so small images still
+// give a full, square tile (RF-DETR resizes its input to a square without
+// keeping the aspect ratio). Padding at bottom/right keeps coordinates
+// unchanged. `inv_scale` maps work-image coordinates back to the original.
+static cv::Mat make_work_image(const cv::Mat& rgb, int size, float pre_scale, float& inv_scale) {
+    cv::Mat work = rgb;
+    inv_scale = 1.0f;
+    if (pre_scale > 0.0f && pre_scale < 1.0f) {
+        cv::resize(rgb, work, cv::Size(), pre_scale, pre_scale, cv::INTER_AREA);
+        inv_scale = static_cast<float>(rgb.cols) / work.cols;  // exact for the rounded size
+    }
+    if (work.cols < size || work.rows < size) {
+        cv::Mat padded;
+        cv::copyMakeBorder(work, padded, 0, std::max(0, size - work.rows), 0, std::max(0, size - work.cols),
+                           cv::BORDER_CONSTANT, cv::Scalar(114, 114, 114));
+        work = padded;
+    }
+    return work;
+}
+
+// 2. Run RF-DETR on one tile and return detections in work-image coordinates.
 //    Uses only its own context, so it is safe to call concurrently with
 //    different contexts.
 static bool detect_tile(rfdetr_context* ctx,
                         const rfdetr_detect_params& dparams,
                         const cv::Mat& rgb_image,
-                        const SliceWindow& slice,
+                        const Tile& tile,
                         std::vector<Detection>& out) {
     // .clone() gives a contiguous HWC buffer for the raw byte pointer
-    cv::Mat tile_rgb = rgb_image(cv::Rect(slice.x, slice.y, slice.width, slice.height)).clone();
+    cv::Mat tile_rgb = rgb_image(cv::Rect(tile.x, tile.y, tile.width, tile.height)).clone();
 
     rfdetr_status st = RFDETR_OK;
-    rfdetr_image* tile = rfdetr_image_from_rgb_buffer(tile_rgb.data, tile_rgb.cols, tile_rgb.rows, &st);
-    if (!tile) {
-        std::fprintf(stderr, "Failed to wrap tile (%d,%d): %s\n", slice.x, slice.y, rfdetr_status_str(st));
+    rfdetr_image* img = rfdetr_image_from_rgb_buffer(tile_rgb.data, tile_rgb.cols, tile_rgb.rows, &st);
+    if (!img) {
+        std::fprintf(stderr, "Failed to wrap tile (%d,%d): %s\n", tile.x, tile.y, rfdetr_status_str(st));
         return false;
     }
 
     rfdetr_detection* dets = nullptr;
     size_t n = 0;
-    st = rfdetr_detect(ctx, tile, &dparams, &dets, &n);
-    rfdetr_image_free(tile);
+    st = rfdetr_detect(ctx, img, &dparams, &dets, &n);
+    rfdetr_image_free(img);
     if (st != RFDETR_OK) {
-        std::fprintf(stderr, "Detection failed on tile (%d,%d): %s\n", slice.x, slice.y, rfdetr_status_str(st));
+        std::fprintf(stderr, "Detection failed on tile (%d,%d): %s\n", tile.x, tile.y, rfdetr_status_str(st));
         return false;
     }
 
@@ -236,8 +276,8 @@ static bool detect_tile(rfdetr_context* ctx,
         const rfdetr_detection& d = dets[i];
         Detection g;
         // Boxes are x1,y1,x2,y2 in tile pixels; translate to full-image coordinates
-        g.box = cv::Rect2f(d.x1 + static_cast<float>(slice.x),
-                           d.y1 + static_cast<float>(slice.y),
+        g.box = cv::Rect2f(d.x1 + static_cast<float>(tile.x),
+                           d.y1 + static_cast<float>(tile.y),
                            d.x2 - d.x1,
                            d.y2 - d.y1);
         g.confidence = d.score;
@@ -249,7 +289,7 @@ static bool detect_tile(rfdetr_context* ctx,
     return true;
 }
 
-// 3. Class-aware Non-Maximum Suppression (NMS) across merged SAHI tiles.
+// 3. Class-aware Non-Maximum Suppression (NMS) across the merged tiles.
 //    Each class is independent, so classes are suppressed in parallel.
 std::vector<Detection> apply_class_aware_nms(
     const std::vector<Detection>& raw_dets,
@@ -276,17 +316,14 @@ std::vector<Detection> apply_class_aware_nms(
     #pragma omp parallel for schedule(dynamic, 1) if (groups.size() > 1)
     for (int g = 0; g < static_cast<int>(groups.size()); ++g) {
         const auto& indices = *groups[g];
-        std::vector<cv::Rect> boxes;
+        std::vector<cv::Rect2d> boxes;
         std::vector<float> scores;
         boxes.reserve(indices.size());
         scores.reserve(indices.size());
 
         for (size_t idx : indices) {
             const auto& b = raw_dets[idx].box;
-            boxes.emplace_back(static_cast<int>(std::round(b.x)),
-                               static_cast<int>(std::round(b.y)),
-                               static_cast<int>(std::round(b.width)),
-                               static_cast<int>(std::round(b.height)));
+            boxes.emplace_back(b.x, b.y, b.width, b.height);
             scores.push_back(raw_dets[idx].confidence);
         }
 
@@ -339,22 +376,26 @@ static void draw_detections(cv::Mat& bgr_image, const std::vector<Detection>& de
     }
 }
 
-// Run SAHI on one image with the given contexts; returns merged detections.
-// Results go into per-tile slots and are concatenated in tile order, so the
-// output is identical regardless of thread scheduling.
-static std::vector<Detection> run_sahi(const std::vector<rfdetr_context*>& contexts,
-                                       const rfdetr_detect_params& dparams,
-                                       const cv::Mat& rgb_image,
-                                       int slice_size,
-                                       const Options& opt,
-                                       size_t& n_tiles, size_t& n_raw, int& failed_tiles) {
-    auto slices = generate_slices(rgb_image.cols, rgb_image.rows, slice_size, slice_size, opt.overlap);
-    n_tiles = slices.size();
+// Detect on all tiles of one image and merge. Results go into per-tile slots
+// and are concatenated in tile order, so the output is identical regardless
+// of thread scheduling.
+static std::vector<Detection> run_tiled(const std::vector<rfdetr_context*>& contexts,
+                                        const rfdetr_detect_params& dparams,
+                                        const cv::Mat& rgb_image,
+                                        int tile_size,
+                                        const Options& opt,
+                                        size_t& n_tiles, size_t& n_raw, int& failed_tiles) {
+    float inv_scale = 1.0f;
+    const cv::Mat work = make_work_image(rgb_image, tile_size, opt.pre_scale, inv_scale);
+    const int stride = opt.stride > 0 ? opt.stride : std::max(1, tile_size / 2);
+    const std::vector<Tile> tiles = tile_grid(work.cols, work.rows, tile_size, stride);
+    n_tiles = tiles.size();
 
     // No point in more workers than tiles
-    const int workers = std::max(1, std::min<int>(static_cast<int>(contexts.size()), static_cast<int>(slices.size())));
+    const int workers = std::max(1, std::min<int>(static_cast<int>(contexts.size()), static_cast<int>(tiles.size())));
+    const float margin = static_cast<float>(opt.margin);
 
-    std::vector<std::vector<Detection>> per_tile(slices.size());
+    std::vector<std::vector<Detection>> per_tile(tiles.size());
     int failed = 0;
     (void)workers;  // only used by the OpenMP pragma
 
@@ -366,22 +407,50 @@ static std::vector<Detection> run_sahi(const std::vector<rfdetr_context*>& conte
         rfdetr_context* ctx = contexts[0];
 #endif
         #pragma omp for schedule(dynamic, 1)
-        for (int i = 0; i < static_cast<int>(slices.size()); ++i) {
-            if (!detect_tile(ctx, dparams, rgb_image, slices[i], per_tile[i])) ++failed;
+        for (int i = 0; i < static_cast<int>(tiles.size()); ++i) {
+            const Tile& t = tiles[i];
+            std::vector<Detection> dets;
+            if (!detect_tile(ctx, dparams, work, t, dets)) { ++failed; continue; }
+
+            // Drop objects touching an *interior* tile edge: with 50% overlap the
+            // neighbouring tile sees them whole. Objects on a real image edge are kept.
+            const bool left_interior = t.x > 0;
+            const bool top_interior = t.y > 0;
+            const bool right_interior = t.x + t.width < work.cols;
+            const bool bottom_interior = t.y + t.height < work.rows;
+            auto& out = per_tile[i];
+            out.reserve(dets.size());
+            for (auto& d : dets) {
+                const float x0 = d.box.x - t.x, y0 = d.box.y - t.y;  // tile-local
+                const float x1 = x0 + d.box.width, y1 = y0 + d.box.height;
+                if (left_interior && x0 <= margin) continue;
+                if (top_interior && y0 <= margin) continue;
+                if (right_interior && x1 >= t.width - margin) continue;
+                if (bottom_interior && y1 >= t.height - margin) continue;
+                out.push_back(std::move(d));
+            }
         }
     }
     failed_tiles = failed;
 
-    size_t total = 0;
-    for (const auto& v : per_tile) total += v.size();
+    // Back to original-image coordinates (undo the pre-scale), clipped to the
+    // real image, i.e. without the gray padding.
     std::vector<Detection> all;
-    all.reserve(total);
+    const float max_x = static_cast<float>(rgb_image.cols), max_y = static_cast<float>(rgb_image.rows);
     for (auto& v : per_tile) {
-        all.insert(all.end(), std::make_move_iterator(v.begin()), std::make_move_iterator(v.end()));
+        for (auto& d : v) {
+            const float x0 = std::clamp(d.box.x * inv_scale, 0.0f, max_x);
+            const float y0 = std::clamp(d.box.y * inv_scale, 0.0f, max_y);
+            const float x1 = std::clamp((d.box.x + d.box.width) * inv_scale, 0.0f, max_x);
+            const float y1 = std::clamp((d.box.y + d.box.height) * inv_scale, 0.0f, max_y);
+            if (x1 - x0 < 1.0f || y1 - y0 < 1.0f) continue;
+            d.box = cv::Rect2f(x0, y0, x1 - x0, y1 - y0);
+            all.push_back(std::move(d));
+        }
     }
     n_raw = all.size();
 
-    // Deduplicate overlapping detections across tile boundaries
+    // Duplicates of objects seen whole by two overlapping tiles
     return apply_class_aware_nms(all, opt.conf, opt.nms_iou);
 }
 
@@ -425,10 +494,10 @@ int main(int argc, char** argv) {
     const bool single = images.size() == 1;
     fs::path out_file, out_dir;
     if (single) {
-        out_file = opt.output.empty() ? fs::path("sahi_output.jpg") : fs::path(opt.output);
-        if (fs::is_directory(out_file)) out_file /= images[0].stem().string() + "_sahi" + images[0].extension().string();
+        out_file = opt.output.empty() ? fs::path("output.jpg") : fs::path(opt.output);
+        if (fs::is_directory(out_file)) out_file /= images[0].stem().string() + "_det" + images[0].extension().string();
     } else {
-        out_dir = opt.output.empty() ? fs::path("sahi_output") : fs::path(opt.output);
+        out_dir = opt.output.empty() ? fs::path("output") : fs::path(opt.output);
         std::error_code ec;
         fs::create_directories(out_dir, ec);
         if (ec) {
@@ -441,7 +510,7 @@ int main(int argc, char** argv) {
     std::map<std::string, int> used_names;
     auto output_for = [&](const fs::path& in) -> fs::path {
         if (single) return out_file;
-        std::string base = in.stem().string() + "_sahi";
+        std::string base = in.stem().string() + "_det";
         std::string ext = in.extension().string();
         int& n = used_names[base + ext];
         std::string name = (++n == 1) ? base + ext : base + "_" + std::to_string(n) + ext;
@@ -487,9 +556,10 @@ int main(int argc, char** argv) {
     omp_set_max_active_levels(2);
 #endif
 
-    // Slice size = the model's native input resolution (384 Nano, 512 Small, 576 Medium)
-    int slice_size = static_cast<int>(rfdetr_context_image_size(contexts[0]));
-    if (slice_size <= 0) slice_size = 576;
+    // Tile size = the model's native input resolution (384 Nano, 512 Small, 576 Medium)
+    int tile_size = static_cast<int>(rfdetr_context_image_size(contexts[0]));
+    if (tile_size <= 0) tile_size = 576;
+    const int stride = opt.stride > 0 ? opt.stride : std::max(1, tile_size / 2);
 
     rfdetr_detect_params dparams{};
     dparams.threshold = opt.conf;
@@ -499,7 +569,10 @@ int main(int argc, char** argv) {
 
     const double init_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
     std::cout << "Model: " << rfdetr_context_variant(contexts[0])
-              << " (input " << slice_size << "x" << slice_size << ") | "
+              << " (input " << tile_size << "x" << tile_size << ") | tiles " << tile_size << ", stride " << stride
+              << ", edge margin " << opt.margin
+              << (opt.pre_scale < 1.0f ? ", pre-scale " + std::to_string(opt.pre_scale).substr(0, 4) : std::string())
+              << " | "
               << workers << " worker(s) x " << threads_per_worker << " thread(s)"
 #ifndef _OPENMP
               << " [built without OpenMP: tiles run sequentially]"
@@ -547,7 +620,7 @@ int main(int argc, char** argv) {
         size_t n_tiles = 0, n_raw = 0;
         int failed_tiles = 0;
         const auto ti = clock::now();
-        std::vector<Detection> merged = run_sahi(contexts, dparams, img.rgb, slice_size, opt, n_tiles, n_raw, failed_tiles);
+        std::vector<Detection> merged = run_tiled(contexts, dparams, img.rgb, tile_size, opt, n_tiles, n_raw, failed_tiles);
         const double infer_ms = std::chrono::duration<double, std::milli>(clock::now() - ti).count();
 
         if (!class_names.empty()) {

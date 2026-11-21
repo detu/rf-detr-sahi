@@ -1,6 +1,10 @@
 # rf-detr-sahi
 
-SAHI implementation in RF-DETR: Slicing Aided Hyper Inference on top of [rf-detr.cpp](https://github.com/mudler/rf-detr.cpp).
+Tiled RF-DETR inference on top of [rf-detr.cpp](https://github.com/mudler/rf-detr.cpp): the
+image is cut into model-sized tiles overlapping by 50%, each tile is run through RF-DETR at
+native resolution, detections cut by an interior tile edge are dropped (the neighbouring
+tile sees those objects whole), and the rest are merged with one NMS. Small objects in
+large images stay at native resolution.
 
 ## Layout
 
@@ -72,15 +76,17 @@ image files and/or directories.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `-o, --output` | `sahi_output.jpg` / `sahi_output/` | output file for one image, output directory for several (`<name>_sahi.<ext>`) |
+| `-o, --output` | `output.jpg` / `output/` | output file for one image, output directory for several (`<name>_det.<ext>`) |
 | `-n, --names` | model's names | text file of class names, one per line: line 1 = class 0, line 2 = class 1, ... |
 | `--csv` | off | write all detections: `image,class_id,class_name,score,x1,y1,x2,y2` |
 | `-r, --recursive` | off | scan directories recursively |
 | `-w, --workers` | 2 | tiles processed in parallel (OpenMP); each worker has its own RF-DETR context |
 | `-t, --threads` | cores / workers | ggml CPU threads per worker |
-| `--overlap` | 0.20 | tile overlap ratio |
+| `--stride` | half a tile | tile stride in pixels (default: 50% overlap) |
+| `--margin` | 8 | drop detections within this many pixels of an interior tile edge |
+| `--pre-scale` | 1 | downscale the image by this factor (0–1] before tiling: fewer tiles, larger objects fit |
 | `--conf` | 0.45 | confidence threshold |
-| `--iou` | 0.50 | NMS IoU threshold |
+| `--iou` | 0.50 | NMS IoU threshold for merging the tiles |
 
 With `--names`, the labels on the output images and the `class_name` column in the
 CSV use the names from the file. Windows line endings and surrounding spaces are
@@ -95,9 +101,30 @@ Directories are scanned for `.jpg .jpeg .png .bmp .tif .tiff .webp` (sorted by n
 The next image is decoded in the background while the current one is processed.
 Images that fail to load are skipped and reported; the exit code is non-zero if any failed.
 
-Slice size is taken from the model's native input resolution (384 Nano, 512 Small,
-576 Medium). Detections are merged with class-aware NMS. Output is deterministic
-regardless of the number of workers.
+### How the tiling works
+
+1. **Work image.** With `--pre-scale f < 1` the image is first downscaled (area
+   averaging). If it is smaller than one tile, it is padded at the bottom/right with gray
+   (114) to one tile, so coordinates don't move.
+2. **Tile grid.** Tiles are the model's native input size (384 Nano, 512 Small, 576
+   Medium), so every tile reaches RF-DETR square and unscaled. They are placed every
+   `stride` pixels (default half a tile, i.e. 50% overlap); the number of tiles per
+   row/column is the smallest that covers the image, and the last tile is clamped to the
+   image border, so there are no partial or duplicate tiles.
+3. **Edge filter.** A detection within `--margin` pixels of an *interior* tile edge (an
+   edge that isn't the image border) is dropped: it is probably cut, and with 50% overlap
+   the neighbouring tile sees the object whole. Detections on the real image border are
+   kept.
+4. **Merge.** The rest is mapped back to the original image (undoing the pre-scale),
+   clipped to the real image (dropping the gray padding) and merged with one class-aware
+   NMS, which removes objects seen whole by two overlapping tiles.
+
+Output is deterministic regardless of the number of workers.
+
+Objects larger than about a tile can't be seen whole by any tile, so the edge filter
+drops them. Use `--pre-scale` to shrink such images until the large objects fit in a
+tile. With 50% overlap there are about 4× as many tiles as without overlap, so
+`--pre-scale` is also the main speed control.
 
 Each worker loads its own copy of the model (about 64 MB for Medium F16, in GPU
 memory with CUDA/Vulkan). With a single GPU, 1–2 workers and 2–4 threads each is
